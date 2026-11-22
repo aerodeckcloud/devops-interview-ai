@@ -11,6 +11,10 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    env:
+      # Lets the app import in CI. This is not a live Groq credential.
+      # Put the real key in the GROQ_API_KEY Actions secret when you deploy.
+      GROQ_API_KEY: ci-placeholder-not-a-real-key
     steps:
       - uses: actions/checkout@v4
 

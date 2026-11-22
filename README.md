@@ -2,6 +2,8 @@
 
 A comprehensive AI-powered learning platform for Cloud Engineering and DevOps careers. Features personalized learning journeys, user authentication, progress tracking, and AI interview practice.
 
+Pull requests are reviewed by Cursor Bugbot before merge. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## 🚀 Production Features
 
 ### 🔐 User Authentication & Management

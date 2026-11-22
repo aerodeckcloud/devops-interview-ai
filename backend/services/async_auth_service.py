@@ -141,7 +141,6 @@ class AsyncAuthService:
             raise ValueError("Username already taken")
 
         hashed_password = self.get_password_hash(user_data.password)
-        existing_user_count = await db.users.count_documents({})
         doc = {
             "user_id": str(uuid.uuid4()),
             "email": user_data.email,
@@ -155,7 +154,7 @@ class AsyncAuthService:
             "last_login": None,
             "is_active": True,
             "email_verified": False,
-            "is_admin": existing_user_count == 0,
+            "is_admin": False,
         }
 
         result = await db.users.insert_one(doc)
