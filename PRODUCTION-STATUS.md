@@ -1,5 +1,7 @@
 # Production Implementation Status
 
+This note is historical. It describes a local run, not a public deployment. The launch runbook is `DIGITALOCEAN.md`.
+
 **Date**: February 15, 2026  
 **Status**: ✅ **PRODUCTION-READY APPLICATION DEPLOYED**
 

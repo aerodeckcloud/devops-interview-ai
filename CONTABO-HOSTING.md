@@ -1,5 +1,7 @@
 # Contabo VPS Hosting Guide (Docker)
 
+This is not the launch path. Production deploy is `DIGITALOCEAN.md`.
+
 This guide is for deploying this project to a Contabo Cloud VPS using Docker Compose.
 
 ## 1) Recommended VPS Baseline
