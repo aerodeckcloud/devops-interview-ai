@@ -67,3 +67,49 @@ class TestAsyncAuthService:
         ):
             info = await collection.index_information()
             assert any(spec.get("expireAfterSeconds") == 0 for spec in info.values())
+
+    @pytest.mark.asyncio
+    async def test_registration_never_grants_admin(self, test_db, sample_user_data, sample_user_data_2):
+        first = await async_auth_service.create_user(test_db, UserCreate(**sample_user_data))
+        second = await async_auth_service.create_user(test_db, UserCreate(**sample_user_data_2))
+        assert first["is_admin"] is False
+        assert second["is_admin"] is False
+
+
+def _production_settings(**overrides):
+    from config import Settings
+
+    values = {
+        "_env_file": None,
+        "ENVIRONMENT": "production",
+        "DEBUG": False,
+        "COOKIE_SECURE": True,
+        "ALLOWED_ORIGINS": "https://app.example.com",
+        "GROQ_API_KEY": "test-groq-key",
+        "JWT_SECRET_KEY": "a" * 48,
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+class TestProductionSettings:
+    def test_production_settings_accept_a_complete_config(self):
+        settings = _production_settings()
+        assert settings.is_production is True
+        assert settings.allowed_origin_list == ["https://app.example.com"]
+
+    def test_production_rejects_placeholder_jwt(self):
+        with pytest.raises(ValueError, match="placeholder"):
+            _production_settings(JWT_SECRET_KEY="change-me-in-production")
+
+    def test_production_rejects_debug_and_insecure_cookies(self):
+        with pytest.raises(ValueError, match="DEBUG must be false"):
+            _production_settings(DEBUG=True)
+        with pytest.raises(ValueError, match="COOKIE_SECURE"):
+            _production_settings(COOKIE_SECURE=False)
+
+    def test_production_rejects_wildcard_origins(self):
+        with pytest.raises(ValueError, match="ALLOWED_ORIGINS"):
+            _production_settings(ALLOWED_ORIGINS="")
+        with pytest.raises(ValueError, match="\\*"):
+            _production_settings(ALLOWED_ORIGINS="*")

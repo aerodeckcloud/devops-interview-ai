@@ -1,0 +1,13 @@
+---
+description: Send every pull request through Cursor Bugbot before merge
+alwaysApply: true
+---
+
+# Pull request review
+
+All pull requests for this repo go through Cursor Bugbot. The project guide is `.cursor/BUGBOT.md`.
+
+- Open work on a branch and a pull request. Do not push launch changes straight to `main`.
+- Bugbot reads `.cursor/BUGBOT.md` and `.cursor/config/bugbot.yaml` (`frequency: everyPush`).
+- If no review appears, comment `cursor review` on the pull request.
+- Leave Bugbot findings that cite the project guide unresolved until they are fixed.

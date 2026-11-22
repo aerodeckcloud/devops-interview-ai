@@ -2,6 +2,8 @@
 
 A comprehensive AI-powered learning platform for Cloud Engineering and DevOps careers. Features personalized learning journeys, user authentication, progress tracking, and AI interview practice.
 
+Pull requests are reviewed by Cursor Bugbot before merge. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## 🚀 Production Features
 
 ### 🔐 User Authentication & Management
@@ -175,8 +177,9 @@ bash ./scripts/prepush-check.sh --skip-frontend-build
 
 ## Deployment Runbooks
 
+- DigitalOcean production launch: `DIGITALOCEAN.md`
 - General deployment notes: `DEPLOYMENT-GUIDE.md`
-- Contabo VPS Docker runbook: `CONTABO-HOSTING.md`
+- Older Contabo notes, not the launch path: `CONTABO-HOSTING.md`
 - Authentication implementation roadmap: `AUTHENTICATION-TASKS.md`
 
 ### Manual Setup (No Docker)

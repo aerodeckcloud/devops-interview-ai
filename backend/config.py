@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool = False
     COOKIE_SAMESITE: str = "lax"
     COOKIE_DOMAIN: str = ""
+    # Comma-separated browser origins. Required in production. Leave empty locally
+    # to allow the development localhost list.
+    ALLOWED_ORIGINS: str = ""
 
     # Verification & Reset Tokens
     EMAIL_VERIFICATION_TOKEN_EXPIRE_HOURS: int = 24
@@ -128,7 +131,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         env = (self.ENVIRONMENT or "").strip().lower()
-        return (not self.DEBUG) or env in {"prod", "production", "staging"}
+        return env in {"prod", "production", "staging"}
+
+    @property
+    def allowed_origin_list(self) -> List[str]:
+        return [item.strip() for item in (self.ALLOWED_ORIGINS or "").split(",") if item.strip()]
 
     @property
     def jwt_previous_secret_keys(self) -> List[str]:
@@ -143,14 +150,15 @@ class Settings(BaseSettings):
         if not secret:
             raise ValueError("JWT_SECRET_KEY must be set")
 
+        hardened = self.is_production or not self.DEBUG
         if self._is_placeholder_secret(secret):
-            if self.is_production:
+            if hardened:
                 raise ValueError(
                     "JWT_SECRET_KEY uses a placeholder value. Set a strong random secret before running in production."
                 )
             return self
 
-        if self.is_production and len(secret) < 32:
+        if hardened and len(secret) < 32:
             raise ValueError(
                 "JWT_SECRET_KEY is too short for production. Use at least 32 characters (48+ recommended)."
             )
@@ -158,6 +166,20 @@ class Settings(BaseSettings):
         for old_key in self.jwt_previous_secret_keys:
             if old_key == secret:
                 raise ValueError("JWT_PREVIOUS_SECRET_KEYS must not include the current JWT_SECRET_KEY")
+
+        if not self.is_production:
+            return self
+
+        if self.DEBUG:
+            raise ValueError("DEBUG must be false when ENVIRONMENT is production or staging.")
+        if not self.COOKIE_SECURE:
+            raise ValueError("COOKIE_SECURE must be true when ENVIRONMENT is production or staging.")
+        if not self.allowed_origin_list:
+            raise ValueError("ALLOWED_ORIGINS must list the public site origin in production.")
+        if "*" in self.allowed_origin_list:
+            raise ValueError("ALLOWED_ORIGINS cannot include '*' when cookies are used.")
+        if not (self.GROQ_API_KEY or "").strip():
+            raise ValueError("GROQ_API_KEY must be set when ENVIRONMENT is production or staging.")
 
         return self
 
