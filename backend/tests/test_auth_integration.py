@@ -12,7 +12,8 @@ class TestAuthEndpoints:
         response = await client.get("/api/health")
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "healthy"
+        assert data["status"] in {"healthy", "degraded"}
+        assert isinstance(data["llm_connected"], bool)
 
     @pytest.mark.asyncio
     async def test_user_registration_success(self, client: AsyncClient, sample_user_data):
