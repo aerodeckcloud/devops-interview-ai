@@ -52,3 +52,18 @@ class TestAsyncAuthService:
     async def test_authenticate_user_async(self, test_db, test_user_in_db):
         user = await async_auth_service.authenticate_user(test_db, "test@example.com", "testpass123")
         assert user is not None
+
+    @pytest.mark.asyncio
+    async def test_expired_auth_tokens_have_ttl_indexes(self, test_db, monkeypatch):
+        from database import init_db
+
+        monkeypatch.setattr("database.get_database", lambda: test_db)
+        await init_db()
+
+        for collection in (
+            test_db.refresh_tokens,
+            test_db.email_verification_tokens,
+            test_db.password_reset_tokens,
+        ):
+            info = await collection.index_information()
+            assert any(spec.get("expireAfterSeconds") == 0 for spec in info.values())
