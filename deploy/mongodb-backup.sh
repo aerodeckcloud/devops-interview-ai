@@ -1,11 +1,41 @@
 #!/usr/bin/env bash
 # Encrypted mongodump plus the avatar upload volume.
 # Run on the droplet from the repo root. Requires BACKUP_PASSPHRASE.
+# Mongo credentials are read from the repo-root .env. Values already exported win.
 # Optional Spaces upload: SPACES_BUCKET, SPACES_ENDPOINT, SPACES_ACCESS_KEY, SPACES_SECRET_KEY.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+load_env_file() {
+  local file="$1" line key val
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      export\ *) line="${line#export }" ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$val" in
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    if [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && [ -z "${!key+x}" ]; then
+      export "$key=$val"
+    fi
+  done < "$file"
+}
+
+load_env_file "$ROOT/.env"
 
 : "${BACKUP_PASSPHRASE:?Set BACKUP_PASSPHRASE}"
 : "${MONGO_ROOT_USERNAME:?Set MONGO_ROOT_USERNAME}"
@@ -58,17 +88,22 @@ if [ -n "${SPACES_BUCKET:-}" ]; then
   AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY" \
   aws s3 cp "$UPLOADS_ENC" "s3://${SPACES_BUCKET}/uploads/$(basename "$UPLOADS_ENC")" \
     --endpoint-url "$SPACES_ENDPOINT"
-  AWS_ACCESS_KEY_ID="$SPACES_ACCESS_KEY" \
-  AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY" \
-  aws s3 ls "s3://${SPACES_BUCKET}/mongo/" --endpoint-url "$SPACES_ENDPOINT" \
-    | awk -v cutoff="$(date -u -d "-${KEEP_DAYS} days" +%Y-%m-%d 2>/dev/null || date -u -v-"${KEEP_DAYS}"d +%Y-%m-%d)" \
-      '$1 < cutoff {print $4}' \
-    | while read -r old; do
-        [ -n "$old" ] || continue
-        AWS_ACCESS_KEY_ID="$SPACES_ACCESS_KEY" \
-        AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY" \
-        aws s3 rm "s3://${SPACES_BUCKET}/mongo/${old}" --endpoint-url "$SPACES_ENDPOINT"
-      done
+  cutoff="$(date -u -d "-${KEEP_DAYS} days" +%Y-%m-%d 2>/dev/null || date -u -v-"${KEEP_DAYS}"d +%Y-%m-%d)"
+  prune_spaces_prefix() {
+    local prefix="$1" old
+    AWS_ACCESS_KEY_ID="$SPACES_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY" \
+    aws s3 ls "s3://${SPACES_BUCKET}/${prefix}" --endpoint-url "$SPACES_ENDPOINT" \
+      | awk -v cutoff="$cutoff" '$1 < cutoff {print $4}' \
+      | while read -r old; do
+          [ -n "$old" ] || continue
+          AWS_ACCESS_KEY_ID="$SPACES_ACCESS_KEY" \
+          AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY" \
+          aws s3 rm "s3://${SPACES_BUCKET}/${prefix}${old}" --endpoint-url "$SPACES_ENDPOINT"
+        done
+  }
+  prune_spaces_prefix "mongo/"
+  prune_spaces_prefix "uploads/"
 fi
 
 echo "Wrote $ENCRYPTED and $UPLOADS_ENC"

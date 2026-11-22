@@ -34,7 +34,7 @@ export COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
 ./deploy/mongodb-backup.sh
 ```
 
-The script writes an encrypted `mongodump` archive and an encrypted copy of `/app/uploads`, keeps 14 days, and uploads both to DigitalOcean Spaces when these are set:
+The script loads Mongo credentials from the repo-root `.env` and leaves variables that are already exported alone. It writes an encrypted `mongodump` archive and an encrypted copy of `/app/uploads`, keeps 14 days locally and in Spaces, and uploads both when these are set:
 
 ```bash
 SPACES_BUCKET=ops-mentor-backups
