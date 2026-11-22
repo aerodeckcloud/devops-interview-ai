@@ -211,6 +211,16 @@ async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
+
+async def require_worker_internal_access(request: Request) -> None:
+    expected_key = (settings.WORKER_INTERNAL_API_KEY or "").strip()
+    if not expected_key:
+        raise HTTPException(status_code=503, detail="Worker internal API key is not configured")
+
+    provided_key = (request.headers.get("x-worker-api-key") or "").strip()
+    if not provided_key or provided_key != expected_key:
+        raise HTTPException(status_code=401, detail="Invalid worker internal API key")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -317,7 +327,40 @@ async def logout_user(request: Request, response: Response, db: AsyncIOMotorData
 
 @app.get("/api/voice/runtime", response_model=VoiceRuntimeStatusResponse)
 async def get_voice_runtime_status():
-    return VoiceRuntimeStatusResponse(**livekit_service.get_runtime_status())
+    runtime_status = livekit_service.get_runtime_status()
+
+    voice_degraded = False
+    voice_degraded_reason = None
+
+    if runtime_status.get("enabled") and runtime_status.get("configured"):
+        provider_ready, availability_reason = await tts_service.check_provider_health(force=True)
+        active_provider = tts_service.active_provider
+        if not provider_ready:
+            voice_degraded = True
+            voice_degraded_reason = availability_reason or "tts_unavailable"
+        elif active_provider == "piper":
+            voice_degraded = False
+            voice_degraded_reason = "using_piper_fallback"
+        elif active_provider != "elevenlabs":
+            voice_degraded = True
+            voice_degraded_reason = f"tts_provider_unrecognized:{active_provider}"
+        else:
+            remaining_credits, subscription_reason = await tts_service.get_subscription_status(force=True)
+            if subscription_reason and subscription_reason != "not_applicable_piper":
+                voice_degraded = True
+                voice_degraded_reason = subscription_reason
+            elif (
+                remaining_credits is not None
+                and remaining_credits < settings.WORKER_TTS_MIN_REMAINING_CREDITS
+            ):
+                voice_degraded = True
+                voice_degraded_reason = f"insufficient_tts_credits:{remaining_credits}"
+
+    return VoiceRuntimeStatusResponse(
+        **runtime_status,
+        voice_degraded=voice_degraded,
+        voice_degraded_reason=voice_degraded_reason,
+    )
 
 
 @app.post("/api/voice/livekit/token", response_model=VoiceSessionTokenResponse)
@@ -336,6 +379,14 @@ async def create_livekit_voice_token(
             display_name=display_name,
         )
 
+        worker_dispatched, worker_dispatch_reason = await livekit_service.ensure_worker_dispatch(
+            room_name=room_name,
+            session_id=payload.session_id,
+            identity=identity,
+            interviewer_style=payload.interviewer_style,
+            interruption_profile=payload.interruption_profile,
+        )
+
         return VoiceSessionTokenResponse(
             provider="livekit",
             room_name=room_name,
@@ -343,11 +394,84 @@ async def create_livekit_voice_token(
             token=token,
             expires_in=expires_in,
             livekit_url=settings.LIVEKIT_URL,
+            worker_dispatched=worker_dispatched,
+            worker_dispatch_reason=worker_dispatch_reason,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/internal/interviewer-v2/sessions/{session_id}/status", response_model=InterviewerV2SessionStatusResponse)
+async def internal_worker_get_interviewer_v2_status(
+    session_id: str,
+    _: None = Depends(require_worker_internal_access),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    session = await db.interviewer_v2_sessions.find_one({"session_id": session_id})
+    if not session:
+        raise HTTPException(status_code=404, detail="Interviewer-v2 session not found")
+
+    user_id = str(session.get("user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Interviewer-v2 session has no user_id")
+
+    try:
+        result = await interviewer_v2_session_service.get_session_status(
+            db=db,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        return InterviewerV2SessionStatusResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch interviewer-v2 session status: {exc}")
+
+
+@app.post("/api/internal/interviewer-v2/sessions/{session_id}/turn", response_model=InterviewerV2SessionTurnResponse)
+async def internal_worker_submit_interviewer_v2_turn(
+    session_id: str,
+    payload: InterviewerV2SessionTurnRequest,
+    _: None = Depends(require_worker_internal_access),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    session = await db.interviewer_v2_sessions.find_one({"session_id": session_id})
+    if not session:
+        raise HTTPException(status_code=404, detail="Interviewer-v2 session not found")
+
+    user_id = str(session.get("user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Interviewer-v2 session has no user_id")
+
+    try:
+        session_status = await interviewer_v2_session_service.get_session_status(
+            db=db,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+        policy_result = interview_policy_service.evaluate_user_response(
+            user_response=payload.user_response,
+            active_question=session_status.get("current_question"),
+            strict_mode=bool(session_status.get("strict_mode", True)),
+        )
+
+        result = await interviewer_v2_session_service.submit_turn(
+            db=db,
+            user_id=user_id,
+            session_id=session_id,
+            user_response=payload.user_response,
+            policy_result=policy_result,
+        )
+        return InterviewerV2SessionTurnResponse(**result)
+    except ValueError as exc:
+        detail = str(exc)
+        code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=code, detail=detail)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to process interviewer-v2 turn: {exc}")
 
 @app.post("/api/auth/request-email-verification", response_model=AuthMessage)
 async def request_email_verification(
@@ -1118,6 +1242,16 @@ async def cleanup_interviewer_v2_artifacts(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup interviewer-v2 artifacts: {exc}")
 
+@app.get("/api/ready")
+async def ready_check():
+    """Liveness for local and Docker runs. Does not call the LLM."""
+    try:
+        await get_database().command("ping")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database is not ready: {exc}")
+    return {"status": "ready"}
+
+
 # Health check endpoint
 @app.get("/api/health", response_model=HealthCheck)
 async def health_check():
@@ -1666,7 +1800,7 @@ async def tts_status(db: AsyncIOMotorDatabase = Depends(get_db)):
     provider_ready, availability_reason = await tts_service.check_provider_health()
     return TtsStatusResponse(
         available=provider_ready,
-        provider="elevenlabs",
+        provider=tts_service.active_provider,
         provider_configured=tts_service.available,
         availability_reason=availability_reason,
         default_voice_id=runtime_config.get("tts_default_voice_id") or None,
@@ -1815,7 +1949,7 @@ async def admin_tts_provider_status(
     provider_ready, availability_reason = await tts_service.check_provider_health(force=force_check)
     return AdminTtsProviderStatusResponse(
         available=provider_ready,
-        provider="elevenlabs",
+        provider=tts_service.active_provider,
         provider_configured=tts_service.available,
         availability_reason=availability_reason,
         default_voice_id=runtime_config.get("tts_default_voice_id") or None,
@@ -1838,15 +1972,15 @@ async def admin_tts_test(
         message = "TTS provider not configured" if reason == "api_key_missing" else f"TTS provider unavailable: {reason}"
         return AdminTtsTestResponse(
             success=False,
-            provider="elevenlabs",
+            provider=tts_service.active_provider,
             availability_reason=reason,
             message=message,
             generated_bytes=0,
         )
 
-    test_text = (payload.text or "ElevenLabs test successful. Admin TTS is ready.").strip()
+    test_text = (payload.text or "TTS test successful. Admin voice synthesis is ready.").strip()
     if not test_text:
-        test_text = "ElevenLabs test successful. Admin TTS is ready."
+        test_text = "TTS test successful. Admin voice synthesis is ready."
 
     stability_value = runtime_config.get("tts_stability", settings.ELEVENLABS_STABILITY)
     similarity_value = runtime_config.get("tts_similarity", settings.ELEVENLABS_SIMILARITY)
@@ -1861,7 +1995,7 @@ async def admin_tts_test(
         generated_bytes = len(audio_bytes or b"")
         return AdminTtsTestResponse(
             success=generated_bytes > 0,
-            provider="elevenlabs",
+            provider=tts_service.active_provider,
             availability_reason=None,
             message="TTS test succeeded." if generated_bytes > 0 else "TTS test failed: empty audio response.",
             generated_bytes=generated_bytes,
@@ -1869,7 +2003,7 @@ async def admin_tts_test(
     except Exception as exc:
         return AdminTtsTestResponse(
             success=False,
-            provider="elevenlabs",
+            provider=tts_service.active_provider,
             availability_reason="synthesis_failed",
             message=f"TTS test failed: {exc}",
             generated_bytes=0,

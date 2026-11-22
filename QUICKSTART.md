@@ -17,6 +17,12 @@ echo "MONGODB_DB_NAME=ops_mentor_ai" >> backend/.env
 docker compose up --build
 ```
 
+To run with the LiveKit AI worker (realtime voice agent), use:
+
+```bash
+docker compose --profile voice up --build
+```
+
 ### 3. Open Browser
 Navigate to: **http://localhost:5173**
 
@@ -28,6 +34,16 @@ Navigate to: **http://localhost:5173**
 1. Make sure you have your Groq API key in backend/.env
 2. Run `docker compose up --build`
 3. Open browser to http://localhost:5173
+
+For voice worker mode, also set these in `backend/.env`:
+- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- `GROQ_API_KEY`
+- `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`
+- `WORKER_STT_PROVIDER=openai` (default) or `deepgram` (+`DEEPGRAM_API_KEY`)
+- `LIVEKIT_DISPATCH_MAX_RETRIES=3`
+- `WORKER_RATE_LIMIT_WINDOW_SECONDS=20`, `WORKER_RATE_LIMIT_MAX_TURNS=8`
+- `WORKER_MAX_REFUSALS_PER_SESSION=6`
+- `WORKER_ALERT_WEBHOOK_URL=` (optional)
 
 ### Running an Interview
 1. **Select Platform**: AWS, Azure, GCP, or Kubernetes

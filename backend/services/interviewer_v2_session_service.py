@@ -7,7 +7,8 @@ import uuid
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 
-TURN_MIN_INTERVAL_SECONDS = 2
+TURN_MIN_INTERVAL_SECONDS = 1
+LOW_CONFIDENCE_RETRY_THRESHOLD = 4.0
 
 
 def _word_count(text: str) -> int:
@@ -50,6 +51,27 @@ def _build_feedback(score: float) -> str:
     if score >= 4.0:
         return "Reasonable baseline; improve with deeper architecture rationale, operational safeguards, and fallback planning."
     return "Answer is too shallow; use a structured approach with diagnosis, decision criteria, implementation, and verification."
+
+
+def _build_study_topics(competency: str, expected_signals: List[str], evidence_refs: List[Dict]) -> List[str]:
+    expected = [str(s).strip() for s in (expected_signals or []) if str(s).strip()]
+    covered = {str(ref.get("signal") or "").strip().lower() for ref in (evidence_refs or [])}
+    missed = [signal for signal in expected if signal.lower() not in covered]
+
+    topics: List[str] = []
+    if missed:
+        topics.extend(missed[:3])
+
+    if not topics:
+        normalized = (competency or "").strip().lower()
+        fallback_map = {
+            "observability and monitoring": ["SLI/SLO design", "alert tuning and noise reduction", "metrics-logs-traces correlation"],
+            "kubernetes operations": ["pod restart triage", "probe tuning", "rollback and progressive delivery"],
+            "cloud architecture": ["multi-region routing", "data consistency patterns", "disaster recovery objectives"],
+        }
+        topics = fallback_map.get(normalized, ["structured incident triage", "trade-off analysis", "validation in production"])
+
+    return topics[:3]
 
 
 def _build_model_answer(competency: str, expected_signals: List[str]) -> str:
@@ -433,6 +455,11 @@ class InterviewerV2SessionService:
             refusal_message = policy_result.get("message") or "I can’t help with that during this interview. Let’s stay focused."
             now = datetime.utcnow()
             expected_signals = current_plan_item.get("expected_signals") or []
+            study_topics = _build_study_topics(
+                competency=str(current_plan_item.get("competency") or "General"),
+                expected_signals=expected_signals,
+                evidence_refs=[],
+            )
             await db.interviewer_v2_turns.insert_one(
                 {
                     "session_id": session_id,
@@ -463,6 +490,7 @@ class InterviewerV2SessionService:
                 "assistant_message": refusal_message,
                 "score": None,
                 "feedback": None,
+                "study_topics": study_topics,
                 "next_question": active_question,
                 "completed": False,
             }
@@ -471,17 +499,34 @@ class InterviewerV2SessionService:
         score = _compute_turn_score(user_response, expected_signals)
         feedback = _build_feedback(score)
         evidence_refs = _build_evidence_refs(user_response, expected_signals)
-
-        next_turn = current_turn + 1
-        completed = next_turn > len(question_plan)
-        status = "completed" if completed else "active"
-        next_question = None if completed else question_plan[next_turn - 1].get("question")
-
-        assistant_message = (
-            "Thank you. That concludes the interview. I will now generate your final assessment and coaching summary."
-            if completed
-            else f"Thanks. Next question: {next_question}"
+        study_topics = _build_study_topics(
+            competency=str(current_plan_item.get("competency") or "General"),
+            expected_signals=expected_signals,
+            evidence_refs=evidence_refs,
         )
+
+        # Keep conversation natural: if answer is weak, stay on current question and coach.
+        should_retry_current_question = score < LOW_CONFIDENCE_RETRY_THRESHOLD
+
+        next_turn = current_turn if should_retry_current_question else (current_turn + 1)
+        completed = (next_turn > len(question_plan)) and not should_retry_current_question
+        status = "completed" if completed else "active"
+        next_question = active_question if should_retry_current_question else (None if completed else question_plan[next_turn - 1].get("question"))
+
+        if completed:
+            assistant_message = "Thank you. That concludes the interview. I will now generate your final assessment and coaching summary."
+        elif should_retry_current_question:
+            assistant_message = (
+                "Thanks for the honest response. Let’s stay on this scenario and build it together. "
+                f"Current question again: {active_question} "
+                "Start with a simple structure: first triage signals, then likely causes, then stabilization steps. "
+                f"Study focus now: {', '.join(study_topics)}."
+            )
+        else:
+            assistant_message = (
+                f"Good progress. Study focus from this answer: {', '.join(study_topics)}. "
+                f"Next question: {next_question}"
+            )
 
         now = datetime.utcnow()
         await db.interviewer_v2_turns.insert_one(
@@ -524,6 +569,7 @@ class InterviewerV2SessionService:
             "assistant_message": assistant_message,
             "score": score,
             "feedback": feedback,
+            "study_topics": study_topics,
             "next_question": next_question,
             "evidence_refs": evidence_refs,
             "completed": completed,

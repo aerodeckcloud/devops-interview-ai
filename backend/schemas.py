@@ -386,11 +386,17 @@ class VoiceRuntimeStatusResponse(BaseModel):
     provider: str
     configured: bool
     livekit_url: Optional[str] = None
+    agent_name: Optional[str] = None
+    auto_dispatch: bool = False
+    voice_degraded: bool = False
+    voice_degraded_reason: Optional[str] = None
 
 
 class VoiceSessionTokenRequest(BaseModel):
     session_id: str = Field(..., min_length=3, max_length=128)
     room_name: Optional[str] = Field(default=None, min_length=3, max_length=128)
+    interviewer_style: Optional[str] = Field(default="coaching", pattern="^(coaching|strict)$")
+    interruption_profile: Optional[str] = Field(default="balanced", pattern="^(low|balanced|high)$")
 
 
 class VoiceSessionTokenResponse(BaseModel):
@@ -400,6 +406,8 @@ class VoiceSessionTokenResponse(BaseModel):
     token: str
     expires_in: int
     livekit_url: str
+    worker_dispatched: bool = False
+    worker_dispatch_reason: Optional[str] = None
 
 
 class InterviewerV2CvUploadResponse(BaseModel):
@@ -500,6 +508,7 @@ class InterviewerV2SessionTurnResponse(BaseModel):
     assistant_message: str
     score: Optional[float] = None
     feedback: Optional[str] = None
+    study_topics: List[str] = Field(default_factory=list)
     next_question: Optional[str] = None
     evidence_refs: List[InterviewerV2EvidenceRef] = Field(default_factory=list)
     completed: bool = False

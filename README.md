@@ -74,6 +74,36 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 docker compose up --build
 ```
 
+To enable the LiveKit AI voice worker (realtime STT/LLM/TTS), run:
+
+```bash
+docker compose --profile voice up --build
+```
+
+Required worker secrets in `backend/.env`:
+- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- `GROQ_API_KEY`
+- `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`
+
+STT provider options:
+- `WORKER_STT_PROVIDER=openai` (default, uses `GROQ_API_KEY`)
+- `WORKER_STT_PROVIDER=deepgram` (requires `DEEPGRAM_API_KEY`)
+
+Recommended dispatch settings:
+- `LIVEKIT_AGENT_NAME=ops-mentor-agent`
+- `LIVEKIT_AUTO_DISPATCH=true`
+- `LIVEKIT_DISPATCH_MAX_RETRIES=3`
+- `LIVEKIT_DISPATCH_INITIAL_BACKOFF_SECONDS=0.4`
+- `LIVEKIT_DISPATCH_MAX_BACKOFF_SECONDS=3.0`
+- `LIVEKIT_DISPATCH_BACKOFF_MULTIPLIER=2.0`
+
+The worker applies runtime guardrails (prompt-injection filter, off-topic filter, profanity filter, turn and message limits).
+For production hardening, also configure:
+- `WORKER_RATE_LIMIT_WINDOW_SECONDS`, `WORKER_RATE_LIMIT_MAX_TURNS`
+- `WORKER_MAX_REFUSALS_PER_SESSION`
+- `WORKER_TELEMETRY_ENABLED=true`
+- `WORKER_ALERT_WEBHOOK_URL=<ops-alert-endpoint>`
+
 ### 4. Open Application
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000

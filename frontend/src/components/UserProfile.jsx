@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { apiService } from '../services/api';
 
 const UserProfile = ({ onNavigate, currentUser, setCurrentUser }) => {
-  const apiOrigin = 'http://localhost:8000';
+  const apiOrigin = '';
   const [isEditing, setIsEditing] = useState(false);
   const [formData, setFormData] = useState({
     full_name: '',

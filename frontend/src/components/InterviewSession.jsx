@@ -1,8 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { Suspense, lazy, useState, useEffect, useRef } from 'react';
 import { FaMicrophone, FaStop, FaPaperPlane, FaVolumeUp, FaVolumeMute } from 'react-icons/fa';
-import { Room } from 'livekit-client';
+import { Room, RoomEvent } from 'livekit-client';
 import { apiService } from '../services/api';
 import { useInterviewStore } from '../store/interviewStore';
+
+const LiveDebugHud = lazy(() => import('./interview/LiveDebugHud'));
+const LiveTranscriptPanels = lazy(() => import('./interview/LiveTranscriptPanels'));
 
 export default function InterviewSession({ onComplete }) {
   const {
@@ -65,9 +68,25 @@ export default function InterviewSession({ onComplete }) {
   const [isLivekitConnecting, setIsLivekitConnecting] = useState(false);
   const [livekitConnected, setLivekitConnected] = useState(false);
   const [livekitError, setLivekitError] = useState('');
+  const [livekitMicEnabled, setLivekitMicEnabled] = useState(false);
+  const [livekitRemoteAudioActive, setLivekitRemoteAudioActive] = useState(false);
+  const [livekitFallbackMessages, setLivekitFallbackMessages] = useState([]);
+  const [livekitTranscriptEntries, setLivekitTranscriptEntries] = useState([]);
+  const [interviewerStyle, setInterviewerStyle] = useState('coaching');
+  const [interruptionProfile, setInterruptionProfile] = useState('balanced');
+  const [isBargeInActive, setIsBargeInActive] = useState(false);
+  const [liveTurnState, setLiveTurnState] = useState('idle');
+  const [lowConfidenceStreak, setLowConfidenceStreak] = useState(0);
+  const [confidenceNotice, setConfidenceNotice] = useState('');
+  const [showLiveDebugHud, setShowLiveDebugHud] = useState(false);
   const livekitRoomRef = useRef(null);
+  const livekitAudioContainerRef = useRef(null);
+  const livekitAttachedAudioElementsRef = useRef(new Set());
+  const livekitAutoJoinAttemptedRef = useRef(false);
+  const bargeInTimerRef = useRef(null);
   const isInterviewRunMode = Boolean(session?.strict_mode) && session?.interview_experience_mode === 'interview_run';
   const isCountdownActive = Number.isFinite(runStartCountdown) && runStartCountdown >= 0;
+  const isLiveInterviewV2 = session?.mode === 'interviewer_v2';
 
   useEffect(() => {
     // Prevent double-loading in React StrictMode
@@ -110,9 +129,9 @@ export default function InterviewSession({ onComplete }) {
         setTtsAvailabilityReason(availabilityReason);
         if (!available) {
           if (availabilityReason) {
-            setTtsNotice(`ElevenLabs unavailable (${availabilityReason}). Using browser voice.`);
+            setTtsNotice(`ElevenLabs unavailable (${availabilityReason}). Live interview stays active with text stream fallback.`);
           }
-          setTtsMode('browser');
+          setTtsMode(isLiveInterviewV2 ? 'api' : 'browser');
           return;
         }
 
@@ -135,14 +154,14 @@ export default function InterviewSession({ onComplete }) {
       } catch (err) {
         setTtsBackendAvailable(false);
         setTtsAvailabilityReason('status_unavailable');
-        setTtsNotice('ElevenLabs unavailable (status_unavailable). Using browser voice.');
+        setTtsNotice('ElevenLabs unavailable (status_unavailable). Live interview stays active with text stream fallback.');
         setApiVoices([]);
-        setTtsMode('browser');
+        setTtsMode(isLiveInterviewV2 ? 'api' : 'browser');
       }
     };
 
     fetchTts();
-  }, []);
+  }, [isLiveInterviewV2]);
 
   useEffect(() => {
     const fetchVoiceRuntimeStatus = async () => {
@@ -230,9 +249,41 @@ export default function InterviewSession({ onComplete }) {
   }, [userCamEnabled, hasWebcam]);
 
   useEffect(() => {
+    if (session?.mode === 'interviewer_v2') {
+      setTtsEnabled(true);
+    }
+  }, [session?.session_id, session?.mode]);
+
+  useEffect(() => {
+    if (session?.session_id) {
+      livekitAutoJoinAttemptedRef.current = false;
+    }
+  }, [session?.session_id]);
+
+  useEffect(() => {
+    if (session?.mode !== 'interviewer_v2') return;
+    if (!voiceRuntimeStatus?.enabled || !voiceRuntimeStatus?.configured) return;
+    if (livekitConnected || isLivekitConnecting) return;
+    if (livekitAutoJoinAttemptedRef.current) return;
+
+    livekitAutoJoinAttemptedRef.current = true;
+    connectLivekitRoom();
+  }, [
+    session?.mode,
+    session?.session_id,
+    voiceRuntimeStatus?.enabled,
+    voiceRuntimeStatus?.configured,
+    livekitConnected,
+    isLivekitConnecting,
+  ]);
+
+  useEffect(() => {
+    // In LiveKit interviewer-v2 mode, spoken prompts come from the room stream.
+    // Avoid local auto-TTS on page load to prevent browser voice playback.
+    if (isLiveInterviewV2) return;
     if (!ttsEnabled || !currentQuestion) return;
     speakQuestion(currentQuestion);
-  }, [ttsEnabled, currentQuestion, ttsMode]);
+  }, [isLiveInterviewV2, ttsEnabled, currentQuestion, ttsMode]);
 
   useEffect(() => () => stopSpeaking(), []);
 
@@ -244,18 +295,55 @@ export default function InterviewSession({ onComplete }) {
 
   useEffect(() => {
     return () => {
+      if (bargeInTimerRef.current) {
+        clearTimeout(bargeInTimerRef.current);
+        bargeInTimerRef.current = null;
+      }
       if (livekitRoomRef.current) {
         livekitRoomRef.current.disconnect();
         livekitRoomRef.current = null;
       }
+      livekitAttachedAudioElementsRef.current.forEach((el) => {
+        try {
+          el.pause();
+        } catch {
+          // no-op
+        }
+        el.remove();
+      });
+      livekitAttachedAudioElementsRef.current.clear();
     };
   }, []);
 
   useEffect(() => {
+    if (isLiveInterviewV2) return;
     if (ttsMode === 'api' && !ttsBackendAvailable) {
       setTtsMode('browser');
     }
-  }, [ttsMode, ttsBackendAvailable]);
+  }, [isLiveInterviewV2, ttsMode, ttsBackendAvailable]);
+
+  useEffect(() => {
+    if (isLivekitConnecting) {
+      setLiveTurnState('connecting');
+      return;
+    }
+    if (!livekitConnected) {
+      setLiveTurnState('idle');
+      return;
+    }
+    if (isSpeaking || isTtsLoading) {
+      setLiveTurnState('responding');
+      return;
+    }
+    setLiveTurnState('listening');
+  }, [isLivekitConnecting, livekitConnected, isSpeaking, isTtsLoading]);
+
+  useEffect(() => {
+    if (!voiceRuntimeStatus?.voice_degraded) return;
+    if (voiceRuntimeStatus?.voice_degraded_reason) {
+      setTtsNotice(`Live worker voice degraded (${voiceRuntimeStatus.voice_degraded_reason}). ElevenLabs voice may be unavailable until credits recover.`);
+    }
+  }, [voiceRuntimeStatus?.voice_degraded, voiceRuntimeStatus?.voice_degraded_reason]);
 
   const loadNextQuestion = async () => {
     setIsProcessing(true);
@@ -282,6 +370,113 @@ export default function InterviewSession({ onComplete }) {
     }
   };
 
+  const cleanupLivekitAudioElements = () => {
+    livekitAttachedAudioElementsRef.current.forEach((el) => {
+      try {
+        el.pause();
+      } catch {
+        // no-op
+      }
+      el.remove();
+    });
+    livekitAttachedAudioElementsRef.current.clear();
+    setLivekitRemoteAudioActive(false);
+  };
+
+  const appendTranscriptEntry = (speaker, text, isFinal = true, confidence = null) => {
+    const content = String(text || '').trim();
+    if (!content) return;
+
+    const timestamp = Date.now();
+    setLivekitTranscriptEntries((previous) => {
+      const last = previous.length ? previous[previous.length - 1] : null;
+      if (
+        last
+        && last.speaker === speaker
+        && last.text === content
+        && Boolean(last.isFinal) === Boolean(isFinal)
+        && (timestamp - Number(last.ts || 0)) < 1500
+      ) {
+        return previous;
+      }
+
+      const next = [...previous];
+      const lastIndex = next.length - 1;
+      const currentLast = lastIndex >= 0 ? next[lastIndex] : null;
+
+      if (currentLast && currentLast.speaker === speaker && !currentLast.isFinal) {
+        // Replace the latest interim entry with newer interim/final text.
+        next[lastIndex] = {
+          ...currentLast,
+          text: content,
+          isFinal,
+          confidence,
+          ts: timestamp,
+        };
+      } else {
+        next.push({ speaker, text: content, isFinal, confidence, ts: timestamp });
+      }
+
+      return next.slice(-18);
+    });
+  };
+
+  const decodeLivekitPayload = (payload) => {
+    if (!payload) return '';
+    try {
+      if (payload instanceof Uint8Array) {
+        return new TextDecoder().decode(payload);
+      }
+      if (typeof payload === 'string') {
+        return payload;
+      }
+      return String(payload);
+    } catch {
+      return '';
+    }
+  };
+
+  const getRecentConfidenceAverage = () => {
+    const recent = (livekitTranscriptEntries || [])
+      .filter((entry) => entry?.speaker === 'you' && entry?.isFinal && typeof entry?.confidence === 'number')
+      .slice(-5);
+    if (!recent.length) return null;
+    const total = recent.reduce((sum, entry) => sum + entry.confidence, 0);
+    return total / recent.length;
+  };
+
+  const getLiveSessionQuality = () => {
+    if (!livekitConnected) {
+      return { label: 'N/A', level: 'na', score: null };
+    }
+
+    let score = 100;
+    if (voiceRuntimeStatus?.voice_degraded) score -= 30;
+    if (!livekitRemoteAudioActive) score -= 10;
+    score -= Math.min(lowConfidenceStreak * 15, 45);
+
+    const recentConfidence = getRecentConfidenceAverage();
+    if (typeof recentConfidence === 'number') {
+      score += Math.round((recentConfidence - 0.8) * 40);
+    }
+
+    score = Math.max(0, Math.min(100, score));
+
+    if (score >= 80) return { label: 'Excellent', level: 'excellent', score };
+    if (score >= 65) return { label: 'Good', level: 'good', score };
+    if (score >= 45) return { label: 'Unstable', level: 'unstable', score };
+    return { label: 'Poor', level: 'poor', score };
+  };
+
+  const liveSessionQuality = getLiveSessionQuality();
+  const qualityClassMap = {
+    excellent: 'text-emerald-200 border-emerald-400/40 bg-emerald-500/15',
+    good: 'text-cyan-100 border-cyan-400/40 bg-cyan-500/15',
+    unstable: 'text-amber-200 border-amber-400/40 bg-amber-500/15',
+    poor: 'text-rose-200 border-rose-400/40 bg-rose-500/15',
+    na: 'text-slate-200 border-slate-400/30 bg-slate-500/10',
+  };
+
   const connectLivekitRoom = async () => {
     if (!session?.session_id || isLivekitConnecting || livekitConnected) return;
 
@@ -289,7 +484,11 @@ export default function InterviewSession({ onComplete }) {
     setIsLivekitConnecting(true);
 
     try {
-      const tokenResponse = await apiService.createLivekitVoiceToken(session.session_id);
+      const tokenResponse = await apiService.createLivekitVoiceToken(
+        session.session_id,
+        null,
+        { interviewerStyle, interruptionProfile }
+      );
       const room = new Room({
         adaptiveStream: true,
         dynacast: true,
@@ -297,15 +496,118 @@ export default function InterviewSession({ onComplete }) {
 
       room.on('disconnected', () => {
         setLivekitConnected(false);
+        setLivekitMicEnabled(false);
+        cleanupLivekitAudioElements();
+        setLivekitFallbackMessages([]);
+        setLivekitTranscriptEntries([]);
+        setIsBargeInActive(false);
+        setLowConfidenceStreak(0);
+        setConfidenceNotice('');
+      });
+
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        if (track.kind !== 'audio') return;
+        const mediaElement = track.attach();
+        mediaElement.autoplay = true;
+        mediaElement.controls = false;
+        mediaElement.style.display = 'none';
+        if (livekitAudioContainerRef.current) {
+          livekitAudioContainerRef.current.appendChild(mediaElement);
+        }
+        livekitAttachedAudioElementsRef.current.add(mediaElement);
+        setLivekitRemoteAudioActive(true);
+      });
+
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        if (track.kind !== 'audio') return;
+        const detached = track.detach();
+        detached.forEach((el) => {
+          livekitAttachedAudioElementsRef.current.delete(el);
+          try {
+            el.pause();
+          } catch {
+            // no-op
+          }
+          el.remove();
+        });
+        setLivekitRemoteAudioActive(livekitAttachedAudioElementsRef.current.size > 0);
+      });
+
+      room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+        if (topic !== 'lk.chat') return;
+
+        const text = decodeLivekitPayload(payload).trim();
+        if (!text) return;
+
+        setLivekitFallbackMessages((previous) => {
+          const last = previous.length ? previous[previous.length - 1] : null;
+          if (last === text) {
+            return previous;
+          }
+          const next = [...previous, text];
+          return next.slice(-6);
+        });
+        appendTranscriptEntry('interviewer', text, true);
+
+        if (ttsEnabled && (!isLiveInterviewV2 || (isLiveInterviewV2 && ttsBackendAvailable))) {
+          speakQuestion(text);
+        }
+      });
+
+      room.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
+        const list = Array.isArray(segments) ? segments : [];
+        if (!list.length) return;
+
+        list.forEach((segment) => {
+          const text = String(segment?.text || '').trim();
+          if (!text) return;
+          const isFinal = Boolean(segment?.final ?? segment?.isFinal ?? true);
+          const confidence = typeof segment?.confidence === 'number' ? segment.confidence : null;
+
+          const identity = String(participant?.identity || '').toLowerCase();
+          const speaker = identity.startsWith('candidate-') ? 'you' : 'interviewer';
+          appendTranscriptEntry(speaker, text, isFinal, confidence);
+
+          if (speaker === 'you' && !isFinal && isSpeaking) {
+            setIsBargeInActive(true);
+            if (bargeInTimerRef.current) {
+              clearTimeout(bargeInTimerRef.current);
+            }
+            bargeInTimerRef.current = setTimeout(() => {
+              setIsBargeInActive(false);
+              bargeInTimerRef.current = null;
+            }, 1200);
+          }
+
+          if (speaker === 'you' && isFinal) {
+            if (typeof confidence === 'number' && confidence < 0.45) {
+              setLowConfidenceStreak((previous) => {
+                const next = previous + 1;
+                if (next >= 2) {
+                  setConfidenceNotice('I may have missed part of that. Please repeat more clearly or send a typed reply.');
+                }
+                return next;
+              });
+            } else {
+              setLowConfidenceStreak(0);
+              setConfidenceNotice('');
+            }
+          }
+        });
       });
 
       await room.connect(tokenResponse.livekit_url, tokenResponse.token);
+      await room.localParticipant.setMicrophoneEnabled(true);
+
       livekitRoomRef.current = room;
       setLivekitConnected(true);
+      setLivekitMicEnabled(true);
     } catch (err) {
       const detail = err?.response?.data?.detail || 'Failed to connect LiveKit room.';
       setLivekitError(String(detail));
       setLivekitConnected(false);
+      setLivekitMicEnabled(false);
+      cleanupLivekitAudioElements();
       if (livekitRoomRef.current) {
         livekitRoomRef.current.disconnect();
         livekitRoomRef.current = null;
@@ -318,11 +620,25 @@ export default function InterviewSession({ onComplete }) {
   const disconnectLivekitRoom = () => {
     if (!livekitRoomRef.current) {
       setLivekitConnected(false);
+      setLivekitMicEnabled(false);
+      cleanupLivekitAudioElements();
+      setLivekitFallbackMessages([]);
+      setLivekitTranscriptEntries([]);
+      setIsBargeInActive(false);
+      setLowConfidenceStreak(0);
+      setConfidenceNotice('');
       return;
     }
     livekitRoomRef.current.disconnect();
     livekitRoomRef.current = null;
     setLivekitConnected(false);
+    setLivekitMicEnabled(false);
+    cleanupLivekitAudioElements();
+    setLivekitFallbackMessages([]);
+    setLivekitTranscriptEntries([]);
+    setIsBargeInActive(false);
+    setLowConfidenceStreak(0);
+    setConfidenceNotice('');
   };
 
   const formatDuration = (seconds) => {
@@ -494,11 +810,17 @@ export default function InterviewSession({ onComplete }) {
       await audio.play();
     } catch (err) {
       console.error('TTS generation error:', err?.response?.data || err?.message || err);
-      setTtsNotice('ElevenLabs unavailable. Using browser voice.');
-      setTtsMode('browser');
+      if (isLiveInterviewV2) {
+        setTtsNotice('ElevenLabs unavailable right now. Live interview continues via transcript and coach stream.');
+      } else {
+        setTtsNotice('ElevenLabs unavailable. Using browser voice.');
+        setTtsMode('browser');
+      }
       setIsSpeaking(false);
       setIsTtsLoading(false);
-      speakBrowserText(text);
+      if (!isLiveInterviewV2) {
+        speakBrowserText(text);
+      }
     }
   };
 
@@ -864,9 +1186,32 @@ export default function InterviewSession({ onComplete }) {
                   <p className="text-xs text-cyan-100">
                     Live Voice Room (beta): {livekitConnected ? 'Connected' : 'Disconnected'}
                   </p>
+                  {livekitConnected && (
+                    <span className="text-[11px] text-cyan-100/90">
+                      Mic: {livekitMicEnabled ? 'On' : 'Off'} • Agent Audio: {livekitRemoteAudioActive ? 'Active' : 'Waiting'}
+                    </span>
+                  )}
+                  {isBargeInActive && (
+                    <span className="text-[11px] text-teal-200">Barge-in detected</span>
+                  )}
                   {voiceRuntimeStatus?.configured === false && (
                     <span className="text-[11px] text-amber-200">Not fully configured</span>
                   )}
+                  {voiceRuntimeStatus?.voice_degraded && (
+                    <span className="text-[11px] text-amber-200">
+                      Voice degraded: {voiceRuntimeStatus?.voice_degraded_reason || 'tts_unavailable'}
+                    </span>
+                  )}
+                  <span className="text-[11px] text-cyan-100/90">
+                    Turn State: {liveTurnState}
+                  </span>
+                  <span
+                    className={`rounded-full border px-2 py-0.5 text-[11px] ${qualityClassMap[liveSessionQuality.level] || qualityClassMap.na}`}
+                    title="Composite quality signal from confidence, fallback state, and agent audio activity."
+                  >
+                    Session Quality: {liveSessionQuality.label}
+                    {typeof liveSessionQuality.score === 'number' && ` (${liveSessionQuality.score})`}
+                  </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   {!livekitConnected ? (
@@ -897,8 +1242,78 @@ export default function InterviewSession({ onComplete }) {
                       {voiceRuntimeStatus.livekit_url}
                     </span>
                   )}
+                  {isLiveInterviewV2 && (
+                    <label className="text-[11px] text-cyan-100 flex items-center gap-2">
+                      Interviewer Style
+                      <select
+                        value={interviewerStyle}
+                        onChange={(event) => setInterviewerStyle(event.target.value)}
+                        className="rounded-md bg-slate-900/80 border border-cyan-500/30 px-2 py-1 text-[11px]"
+                        disabled={livekitConnected}
+                      >
+                        <option value="coaching">Coaching</option>
+                        <option value="strict">Strict</option>
+                      </select>
+                    </label>
+                  )}
+                  {isLiveInterviewV2 && (
+                    <label className="text-[11px] text-cyan-100 flex items-center gap-2">
+                      Interruption
+                      <select
+                        value={interruptionProfile}
+                        onChange={(event) => setInterruptionProfile(event.target.value)}
+                        className="rounded-md bg-slate-900/80 border border-cyan-500/30 px-2 py-1 text-[11px]"
+                        disabled={livekitConnected}
+                      >
+                        <option value="low">Low</option>
+                        <option value="balanced">Balanced</option>
+                        <option value="high">High</option>
+                      </select>
+                    </label>
+                  )}
+                  {isLiveInterviewV2 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowLiveDebugHud((previous) => !previous)}
+                      className="btn btn-secondary px-2 py-1 text-[11px]"
+                    >
+                      {showLiveDebugHud ? 'Hide Debug' : 'Show Debug'}
+                    </button>
+                  )}
                 </div>
+                <div ref={livekitAudioContainerRef} aria-hidden="true" />
                 {livekitError && <p className="mt-2 text-xs text-rose-200">{livekitError}</p>}
+                {confidenceNotice && (
+                  <p className="mt-2 text-xs text-amber-200">{confidenceNotice}</p>
+                )}
+                {showLiveDebugHud && isLiveInterviewV2 && (
+                  <Suspense
+                    fallback={<div className="mt-3 rounded-lg border border-cyan-400/20 bg-slate-900/40 p-3 text-xs text-slate-300">Loading debug HUD...</div>}
+                  >
+                    <LiveDebugHud
+                      livekitConnected={livekitConnected}
+                      voiceDegraded={Boolean(voiceRuntimeStatus?.voice_degraded)}
+                      liveTurnState={liveTurnState}
+                      interviewerStyle={interviewerStyle}
+                      interruptionProfile={interruptionProfile}
+                      livekitMicEnabled={livekitMicEnabled}
+                      livekitRemoteAudioActive={livekitRemoteAudioActive}
+                      isBargeInActive={isBargeInActive}
+                      lowConfidenceStreak={lowConfidenceStreak}
+                      livekitTranscriptEntries={livekitTranscriptEntries}
+                    />
+                  </Suspense>
+                )}
+                {(livekitFallbackMessages.length > 0 || livekitTranscriptEntries.length > 0) && (
+                  <Suspense
+                    fallback={<div className="mt-3 rounded-lg border border-cyan-400/20 bg-slate-900/40 p-3 text-xs text-slate-300">Loading transcript panels...</div>}
+                  >
+                    <LiveTranscriptPanels
+                      livekitFallbackMessages={livekitFallbackMessages}
+                      livekitTranscriptEntries={livekitTranscriptEntries}
+                    />
+                  </Suspense>
+                )}
               </div>
             )}
 
@@ -917,7 +1332,7 @@ export default function InterviewSession({ onComplete }) {
                 disabled={!currentQuestion || isProcessing || isTtsLoading}
                 className="btn btn-success px-4 py-2"
               >
-                {isTtsLoading ? 'Speaking...' : 'Speak Question'}
+                {isTtsLoading ? 'Speaking...' : 'Replay Question'}
               </button>
               <button
                 type="button"
@@ -936,8 +1351,9 @@ export default function InterviewSession({ onComplete }) {
                   value={ttsMode}
                   onChange={(event) => setTtsMode(event.target.value)}
                   className="input-base mt-2"
+                  disabled={isLiveInterviewV2}
                 >
-                  <option value="browser">Browser</option>
+                  {!isLiveInterviewV2 && <option value="browser">Browser</option>}
                   <option value="api" disabled={!ttsBackendAvailable}>
                     ElevenLabs
                   </option>
@@ -982,9 +1398,15 @@ export default function InterviewSession({ onComplete }) {
                 </p>
               )}
 
-              {!ttsBackendAvailable && ttsMode === 'browser' && (
+              {!ttsBackendAvailable && !isLiveInterviewV2 && ttsMode === 'browser' && (
                 <p className="text-xs text-amber-300">
                   ElevenLabs unavailable ({ttsAvailabilityReason || 'provider_unavailable'}). Using browser voice.
+                </p>
+              )}
+
+              {!ttsBackendAvailable && isLiveInterviewV2 && (
+                <p className="text-xs text-amber-300">
+                  ElevenLabs unavailable ({ttsAvailabilityReason || 'provider_unavailable'}). LiveKit conversation continues via text stream fallback.
                 </p>
               )}
 
@@ -1062,31 +1484,49 @@ export default function InterviewSession({ onComplete }) {
 
           {/* Controls */}
           <div className="flex flex-col sm:flex-row gap-3 sm:gap-4">
-            {!isRecording ? (
-              <button
-                onClick={startRecording}
-                disabled={isProcessing || isCountdownActive}
-                className="btn btn-success px-6 py-3"
-              >
-                <FaMicrophone /> Start Recording
-              </button>
+            {isLiveInterviewV2 ? (
+              <>
+                <div className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-3 text-xs text-cyan-100">
+                  LiveKit interview mode is active. Speak naturally; no manual Start Recording is required.
+                </div>
+                <button
+                  onClick={submitAnswer}
+                  disabled={isRecording || isProcessing || !currentAnswer.trim() || remainingSeconds === 0 || isCountdownActive}
+                  className="btn btn-info px-6 py-3 sm:ml-auto"
+                >
+                  <FaPaperPlane />
+                  {isProcessing ? 'Processing...' : 'Send Typed Reply'}
+                </button>
+              </>
             ) : (
-              <button
-                onClick={stopRecording}
-                className="btn btn-danger px-6 py-3 animate-pulse"
-              >
-                <FaStop /> Stop Recording
-              </button>
-            )}
+              <>
+                {!isRecording ? (
+                  <button
+                    onClick={startRecording}
+                    disabled={isProcessing || isCountdownActive}
+                    className="btn btn-success px-6 py-3"
+                  >
+                    <FaMicrophone /> Start Recording
+                  </button>
+                ) : (
+                  <button
+                    onClick={stopRecording}
+                    className="btn btn-danger px-6 py-3 animate-pulse"
+                  >
+                    <FaStop /> Stop Recording
+                  </button>
+                )}
 
-            <button
-              onClick={submitAnswer}
-              disabled={isRecording || isProcessing || !currentAnswer.trim() || remainingSeconds === 0 || isCountdownActive}
-              className="btn btn-info px-6 py-3 sm:ml-auto"
-            >
-              <FaPaperPlane />
-              {isProcessing ? 'Processing...' : 'Submit Answer'}
-            </button>
+                <button
+                  onClick={submitAnswer}
+                  disabled={isRecording || isProcessing || !currentAnswer.trim() || remainingSeconds === 0 || isCountdownActive}
+                  className="btn btn-info px-6 py-3 sm:ml-auto"
+                >
+                  <FaPaperPlane />
+                  {isProcessing ? 'Processing...' : 'Submit Answer'}
+                </button>
+              </>
+            )}
           </div>
         </div>
 

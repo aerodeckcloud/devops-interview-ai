@@ -48,7 +48,7 @@ docker compose version
 ## 5) Clone and Configure App
 
 ```bash
-git clone https://github.com/bizvoguedigital/devopstutor.git
+git clone https://github.com/mangatohjunior/devops-interview-ai.git
 cd devopstutor
 ```
 

@@ -118,10 +118,11 @@ export default function AdminConsole({ currentUser, onBack }) {
     try {
       const status = await apiService.getAdminTtsProviderStatus(true);
       setTtsProviderStatus(status);
+      const providerName = status?.provider || 'tts';
       if (status?.available) {
-        setMessage('ElevenLabs provider is ready.');
+        setMessage(`${providerName} provider is ready.`);
       } else {
-        setMessage(`ElevenLabs not ready: ${status?.availability_reason || 'unknown_reason'}`);
+        setMessage(`${providerName} not ready: ${status?.availability_reason || 'unknown_reason'}`);
       }
     } catch (err) {
       setError(err?.response?.data?.detail || 'Failed to refresh TTS provider status.');

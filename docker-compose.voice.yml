@@ -1,0 +1,49 @@
+# Free local voice stack. LiveKit and Piper run on this machine.
+# Groq remains the free speech-to-text and language model.
+#
+# docker compose -f docker-compose.yml -f docker-compose.voice.yml --profile voice up --build
+services:
+  livekit:
+    image: livekit/livekit-server:v1.8.3
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./deploy/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "127.0.0.1:7880:7880"
+      - "127.0.0.1:7881:7881"
+      - "127.0.0.1:7882:7882/udp"
+
+  backend:
+    environment:
+      VOICE_AGENT_RUNTIME_ENABLED: "true"
+      LIVEKIT_URL: ws://127.0.0.1:7880
+      LIVEKIT_INTERNAL_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secret
+      TTS_PROVIDER: piper
+      PIPER_TTS_ENABLED: "true"
+      PIPER_BINARY_PATH: piper
+      PIPER_MODEL_PATH: /app/models/en_US-amy-medium.onnx
+      PIPER_CONFIG_PATH: /app/models/en_US-amy-medium.onnx.json
+    depends_on:
+      livekit:
+        condition: service_started
+
+  voice-worker:
+    environment:
+      LIVEKIT_URL: ws://127.0.0.1:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secret
+      WORKER_TTS_PROVIDER: piper
+      PIPER_TTS_ENABLED: "true"
+      PIPER_BINARY_PATH: piper
+      PIPER_MODEL_PATH: /app/models/en_US-amy-medium.onnx
+      PIPER_CONFIG_PATH: /app/models/en_US-amy-medium.onnx.json
+      WORKER_STT_PROVIDER: openai
+      WORKER_STT_MODEL: whisper-large-v3-turbo
+      WORKER_LLM_MODEL: qwen/qwen3.8-27b
+    network_mode: service:livekit
+    depends_on:
+      livekit:
+        condition: service_started

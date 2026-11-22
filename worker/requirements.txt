@@ -1,0 +1,7 @@
+livekit-agents
+livekit-plugins-deepgram
+livekit-plugins-elevenlabs
+livekit-plugins-openai
+livekit-plugins-silero
+pydantic==2.6.1
+pydantic-settings==2.1.0

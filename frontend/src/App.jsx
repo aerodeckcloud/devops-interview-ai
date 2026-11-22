@@ -1,18 +1,19 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import { FaBars, FaTimes, FaUserEdit, FaSignOutAlt, FaBolt } from 'react-icons/fa';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
-import HomeScreen from './components/HomeScreen';
-import SessionSetupNew from './components/SessionSetupNew';
-import InterviewSession from './components/InterviewSession';
-import SessionSummary from './components/SessionSummary';
-import AwsStudyMode from './components/AwsStudyMode';
-import ExamSimulator from './components/ExamSimulator';
-import AuthScreen from './components/AuthScreen';
-import CareerJourneyScreen from './components/CareerJourneyScreen';
-import UserProfile from './components/UserProfile';
-import AdminConsole from './components/AdminConsole';
 import { apiService } from './services/api';
 import { useInterviewStore } from './store/interviewStore';
+
+const HomeScreen = lazy(() => import('./components/HomeScreen'));
+const SessionSetupNew = lazy(() => import('./components/SessionSetupNew'));
+const InterviewSession = lazy(() => import('./components/InterviewSession'));
+const SessionSummary = lazy(() => import('./components/SessionSummary'));
+const AwsStudyMode = lazy(() => import('./components/AwsStudyMode'));
+const ExamSimulator = lazy(() => import('./components/ExamSimulator'));
+const AuthScreen = lazy(() => import('./components/AuthScreen'));
+const CareerJourneyScreen = lazy(() => import('./components/CareerJourneyScreen'));
+const UserProfile = lazy(() => import('./components/UserProfile'));
+const AdminConsole = lazy(() => import('./components/AdminConsole'));
 
 function App() {
   const sessionSummaryStorageKey = 'opsmentorai:sessionSummary';
@@ -133,11 +134,17 @@ function App() {
         return;
       }
       const status = error?.response?.status;
+      const detail = error?.response?.data?.detail;
+      const signedOut =
+        status === 401 &&
+        (detail === 'Missing refresh token' || detail === 'Missing authentication credentials' || !detail);
       if (status && status !== 401) {
         console.error('Auth check failed:', error);
         setAuthNotice(null);
-      } else if (status === 401) {
+      } else if (status === 401 && !signedOut) {
         setAuthNotice('Session expired. Please sign in again.');
+      } else {
+        setAuthNotice(null);
       }
       setCurrentUser(null);
     } finally {
@@ -474,7 +481,16 @@ function App() {
 
       {/* Main Content */}
       <div className="py-5 sm:py-8">
-        <Routes>
+        <Suspense
+          fallback={(
+            <div className="mx-auto max-w-7xl px-4 sm:px-6">
+              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-6 text-sm text-slate-300">
+                Loading workspace...
+              </div>
+            </div>
+          )}
+        >
+          <Routes>
           <Route
             path="/"
             element={<HomeScreen onModeSelect={handleModeSelect} currentUser={currentUser} />}
@@ -551,8 +567,9 @@ function App() {
               )
             }
           />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
       </div>
 
       <footer className="app-footer mx-auto max-w-7xl px-4 sm:px-6 pb-6 sm:pb-10">

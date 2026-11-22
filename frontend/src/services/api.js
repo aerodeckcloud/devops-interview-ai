@@ -41,7 +41,10 @@ api.interceptors.response.use(
         return api(originalRequest);
       } catch (refreshError) {
         localStorage.removeItem('user');
-        notifySessionExpired();
+        const detail = refreshError?.response?.data?.detail;
+        if (detail !== 'Missing refresh token') {
+          notifySessionExpired();
+        }
         return Promise.reject(refreshError);
       }
     }
@@ -144,10 +147,12 @@ export const apiService = {
     return response.data;
   },
 
-  createLivekitVoiceToken: async (sessionId, roomName = null) => {
+  createLivekitVoiceToken: async (sessionId, roomName = null, options = {}) => {
     const payload = {
       session_id: sessionId,
       room_name: roomName,
+      interviewer_style: options?.interviewerStyle || 'coaching',
+      interruption_profile: options?.interruptionProfile || 'balanced',
     };
     const response = await api.post('/voice/livekit/token', payload);
     return response.data;
