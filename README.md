@@ -173,8 +173,9 @@ bash ./scripts/prepush-check.sh --skip-frontend-build
 
 ## Deployment Runbooks
 
+- DigitalOcean production launch: `DIGITALOCEAN.md`
 - General deployment notes: `DEPLOYMENT-GUIDE.md`
-- Contabo VPS Docker runbook: `CONTABO-HOSTING.md`
+- Older Contabo notes, not the launch path: `CONTABO-HOSTING.md`
 - Authentication implementation roadmap: `AUTHENTICATION-TASKS.md`
 
 ### Manual Setup (No Docker)

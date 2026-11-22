@@ -1,0 +1,6 @@
+# Caddy terminates TLS for one hostname and forwards to the frontend container.
+# The frontend nginx server proxies /api to the backend, so the browser stays on this origin.
+{$SITE_ADDRESS} {
+	encode gzip
+	reverse_proxy frontend:80
+}

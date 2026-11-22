@@ -7,18 +7,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.HOSTINGER_HOST }}
-          username: ${{ secrets.HOSTINGER_USER }}
-          key: ${{ secrets.HOSTINGER_SSH_KEY }}
-          script: |
-            set -e
-            cd ${{ secrets.HOSTINGER_APP_DIR }}
-            git fetch --all
-            git checkout main
-            git pull origin main
-            docker compose down
-            docker compose up -d --build
-            docker image prune -f
+      - name: Retired
+        run: |
+          echo "This Hostinger deploy is retired. It ran docker compose down before the new build."
+          echo "Use DIGITALOCEAN.md: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build"
+          exit 1
