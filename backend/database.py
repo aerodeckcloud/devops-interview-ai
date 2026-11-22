@@ -31,8 +31,11 @@ async def init_db() -> None:
 
     await db.refresh_tokens.create_index("jti", unique=True)
     await db.refresh_tokens.create_index("token_hash")
+    await db.refresh_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.email_verification_tokens.create_index("token_hash")
+    await db.email_verification_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.password_reset_tokens.create_index("token_hash")
+    await db.password_reset_tokens.create_index("expires_at", expireAfterSeconds=0)
 
     await db.interview_sessions.create_index("session_id", unique=True)
     await db.question_responses.create_index([("session_id", 1), ("question_number", 1)])

@@ -76,6 +76,8 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 docker compose up --build
 ```
 
+Compose MongoDB requires `MONGO_ROOT_USERNAME`, `MONGO_ROOT_PASSWORD`, `MONGO_APP_USERNAME`, and `MONGO_APP_PASSWORD` in the repo-root `.env`. See `deploy/MONGODB.md`. An existing `mongodb_data` volume from before authentication must be recreated after a dump.
+
 To enable the LiveKit AI voice worker (realtime STT/LLM/TTS), run:
 
 ```bash

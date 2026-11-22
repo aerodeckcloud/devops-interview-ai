@@ -54,6 +54,21 @@ class TestAsyncAuthService:
         assert user is not None
 
     @pytest.mark.asyncio
+    async def test_expired_auth_tokens_have_ttl_indexes(self, test_db, monkeypatch):
+        from database import init_db
+
+        monkeypatch.setattr("database.get_database", lambda: test_db)
+        await init_db()
+
+        for collection in (
+            test_db.refresh_tokens,
+            test_db.email_verification_tokens,
+            test_db.password_reset_tokens,
+        ):
+            info = await collection.index_information()
+            assert any(spec.get("expireAfterSeconds") == 0 for spec in info.values())
+
+    @pytest.mark.asyncio
     async def test_registration_never_grants_admin(self, test_db, sample_user_data, sample_user_data_2):
         first = await async_auth_service.create_user(test_db, UserCreate(**sample_user_data))
         second = await async_auth_service.create_user(test_db, UserCreate(**sample_user_data_2))
