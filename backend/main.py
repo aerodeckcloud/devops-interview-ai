@@ -1,9 +1,12 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status, Request, Response, Query
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from motor.motor_asyncio import AsyncIOMotorDatabase
+import hmac
+import logging
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,6 +14,7 @@ from typing import List, Optional, Literal
 
 from config import settings
 from database import init_db, get_db, get_database
+from rate_limit import limit_ai_requests, limit_auth_requests
 from schemas import (
     SessionCreate, SessionResponse, QuestionRequest, QuestionResponse,
     AnswerSubmit, AnswerEvaluation, TranscriptionResponse,
@@ -57,6 +61,8 @@ from services.cv_jd_service import cv_jd_service
 from services.interview_orchestrator_service import interview_orchestrator_service
 from services.interview_policy_service import interview_policy_service
 from services.interviewer_v2_session_service import interviewer_v2_session_service
+
+logger = logging.getLogger("opsmentor")
 from services.livekit_service import livekit_service
 import os
 
@@ -218,8 +224,20 @@ async def require_worker_internal_access(request: Request) -> None:
         raise HTTPException(status_code=503, detail="Worker internal API key is not configured")
 
     provided_key = (request.headers.get("x-worker-api-key") or "").strip()
-    if not provided_key or provided_key != expected_key:
+    if not provided_key or not hmac.compare_digest(provided_key, expected_key):
         raise HTTPException(status_code=401, detail="Invalid worker internal API key")
+
+
+async def limit_ai_user(current_user: dict = Depends(get_current_user)) -> dict:
+    limit_ai_requests(str(current_user.get("user_id") or ""))
+    return current_user
+
+
+async def owned_interview_session(db: AsyncIOMotorDatabase, session_id: str, current_user: dict) -> dict:
+    session = await db.interview_sessions.find_one({"session_id": session_id})
+    if not session or session.get("user_id") != current_user.get("user_id"):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -239,21 +257,34 @@ app = FastAPI(
     title="Ops Mentor AI",
     description="AI-powered cloud, DevOps, and interview practice platform",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
 )
 
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    logger.exception("Unhandled error on %s", request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+_DEV_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://localhost:3000",
+]
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://localhost:3000",
-    ],
+    allow_origins=settings.allowed_origin_list or _DEV_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -268,9 +299,11 @@ app.add_middleware(
 async def register_user(
     user_data: UserCreate,
     response: Response,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Register a new user"""
+    limit_auth_requests(request)
     try:
         token, refresh_token, expires_in = await async_auth_service.register_user(db, user_data)
         set_auth_cookies(response, token.access_token, refresh_token, expires_in)
@@ -279,16 +312,18 @@ async def register_user(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         # Log the actual error for debugging
-        print(f"Registration error: {e}")
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+        logger.exception("Registration failed")
+        raise HTTPException(status_code=500, detail="Registration failed")
 
 @app.post("/api/auth/login", response_model=Token)
 async def login_user(
     login_data: UserLogin,
     response: Response,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Login user and return access token"""
+    limit_auth_requests(request)
     try:
         token, refresh_token, expires_in = await async_auth_service.login_user(db, login_data)
         set_auth_cookies(response, token.access_token, refresh_token, expires_in)
@@ -305,6 +340,7 @@ async def refresh_access_token(
     response: Response,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    limit_auth_requests(request)
     refresh_token = request.cookies.get(settings.REFRESH_COOKIE_NAME)
     if not refresh_token:
         raise HTTPException(status_code=401, detail="Missing refresh token")
@@ -366,11 +402,21 @@ async def get_voice_runtime_status():
 @app.post("/api/voice/livekit/token", response_model=VoiceSessionTokenResponse)
 async def create_livekit_voice_token(
     payload: VoiceSessionTokenRequest,
-    current_user: Optional[dict] = Depends(get_current_user_optional),
+    current_user: dict = Depends(limit_ai_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     try:
-        user_id = current_user.get("user_id") if current_user else None
-        display_name = current_user.get("username") if current_user else "candidate"
+        user_id = current_user.get("user_id")
+        display_name = current_user.get("username") or "candidate"
+        owned = await db.interview_sessions.find_one(
+            {"session_id": payload.session_id, "user_id": user_id}
+        )
+        if not owned:
+            owned = await db.interviewer_v2_sessions.find_one(
+                {"session_id": payload.session_id, "user_id": user_id}
+            )
+        if not owned:
+            raise HTTPException(status_code=404, detail="Session not found")
 
         token, room_name, identity, expires_in = livekit_service.issue_session_token(
             session_id=payload.session_id,
@@ -476,8 +522,10 @@ async def internal_worker_submit_interviewer_v2_turn(
 @app.post("/api/auth/request-email-verification", response_model=AuthMessage)
 async def request_email_verification(
     payload: EmailVerificationRequest,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    limit_auth_requests(request)
     user = await async_auth_service.get_user_by_email(db, payload.email)
     if not user:
         return AuthMessage(message="If the account exists, a verification link has been generated.")
@@ -500,8 +548,10 @@ async def verify_email(payload: EmailVerificationConfirm, db: AsyncIOMotorDataba
 @app.post("/api/auth/request-password-reset", response_model=AuthMessage)
 async def request_password_reset(
     payload: PasswordResetRequest,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    limit_auth_requests(request)
     user = await async_auth_service.get_user_by_email(db, payload.email)
     if not user:
         return AuthMessage(message="If the account exists, a reset link has been generated.")
@@ -831,6 +881,7 @@ async def get_interview_analytics(
 @app.post("/api/journey/recommend", response_model=CareerJourneyResponse)
 async def get_career_journey(
     journey_request: CareerJourneyRequest,
+    current_user: dict = Depends(limit_ai_user),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Get personalized career journey recommendations"""
@@ -842,7 +893,7 @@ async def get_career_journey(
 @app.post("/api/journey/plan", response_model=JourneyPlanResponse)
 async def get_journey_plan(
     journey_request: CareerJourneyRequest,
-    current_user: Optional[dict] = Depends(get_current_user_optional),
+    current_user: dict = Depends(limit_ai_user),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Get step-by-step journey plan with teaching, hands-on, and MCQs"""
@@ -850,7 +901,7 @@ async def get_journey_plan(
         return await learning_service.get_journey_plan(
             db,
             journey_request,
-            user_id=current_user.get("user_id") if current_user else None
+            user_id=current_user.get("user_id")
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1247,8 +1298,9 @@ async def ready_check():
     """Liveness for local and Docker runs. Does not call the LLM."""
     try:
         await get_database().command("ping")
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database is not ready: {exc}")
+    except Exception:
+        logger.exception("Readiness check failed")
+        raise HTTPException(status_code=503, detail="Database is not ready")
     return {"status": "ready"}
 
 
@@ -1268,7 +1320,7 @@ async def health_check():
 @app.post("/api/exams/start", response_model=ExamSessionResponse)
 async def start_exam(
     request: ExamStartRequest,
-    current_user: Optional[dict] = Depends(get_current_user_optional),
+    current_user: dict = Depends(limit_ai_user),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     exam_id = str(uuid.uuid4())
@@ -1277,7 +1329,7 @@ async def start_exam(
 
     exam_session = {
         "exam_id": exam_id,
-        "user_id": current_user.get("user_id") if current_user else None,
+        "user_id": current_user.get("user_id"),
         "certificate": request.certificate,
         "question_count": request.question_count,
         "duration_minutes": duration_minutes,
@@ -1547,21 +1599,16 @@ async def submit_exam(
 @app.post("/api/sessions", response_model=SessionResponse)
 async def create_session(
     session_data: SessionCreate,
-    current_user: Optional[dict] = Depends(get_current_user_optional),
+    current_user: dict = Depends(limit_ai_user),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
-    """Create a new interview session (supports both authenticated and anonymous users)"""
+    """Create a new interview session for the signed-in user."""
     try:
-        print(f"Creating session with data: {session_data}")
-        print(f"Platform: {session_data.platform}, Difficulty: {session_data.difficulty}")
-        print(f"Career track: {session_data.career_track}, Module ID: {session_data.module_id}")
-        print(f"Current user: {current_user.get('user_id') if current_user else 'Anonymous'}")
-        
         session_id = str(uuid.uuid4())
 
         new_session = {
             "session_id": session_id,
-            "user_id": current_user.get("user_id") if current_user else None,
+            "user_id": current_user.get("user_id"),
             "platform": session_data.platform,
             "difficulty": session_data.difficulty,
             "career_track": session_data.career_track,
@@ -1576,7 +1623,6 @@ async def create_session(
         }
 
         await db.interview_sessions.insert_one(new_session)
-        print("Session stored in MongoDB")
 
         response = SessionResponse(
             session_id=new_session["session_id"],
@@ -1588,27 +1634,22 @@ async def create_session(
             status=new_session["status"],
             user_id=new_session.get("user_id")
         )
-        
-        print(f"Session created successfully: {new_session['session_id']}")
         return response
-        
+
     except ValueError as ve:
-        print(f"Validation error creating session: {ve}")
-        raise HTTPException(status_code=400, detail=f"Invalid session data: {str(ve)}")
-    except Exception as e:
-        print(f"Unexpected error creating session: {e}")
-        print(f"Error type: {type(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid session data")
+    except Exception:
+        logger.exception("Failed to create session")
+        raise HTTPException(status_code=500, detail="Failed to create session")
 
 @app.get("/api/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str, db: AsyncIOMotorDatabase = Depends(get_db)):
+async def get_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
     """Get session details"""
-    session = await db.interview_sessions.find_one({"session_id": session_id})
-
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session = await owned_interview_session(db, session_id, current_user)
 
     return SessionResponse(
         session_id=session.get("session_id"),
@@ -1622,14 +1663,12 @@ async def get_session(session_id: str, db: AsyncIOMotorDatabase = Depends(get_db
 @app.post("/api/questions/generate", response_model=QuestionResponse)
 async def generate_question(
     request: QuestionRequest,
+    current_user: dict = Depends(limit_ai_user),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Generate a new interview question"""
 
-    session = await db.interview_sessions.find_one({"session_id": request.session_id})
-
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session = await owned_interview_session(db, request.session_id, current_user)
 
     runtime_config = await get_runtime_config(db)
     configured_max_questions = int(runtime_config.get("max_question_count", settings.MAX_QUESTION_COUNT))
@@ -1699,10 +1738,12 @@ async def generate_question(
 @app.post("/api/answers/submit", response_model=AnswerEvaluation)
 async def submit_answer(
     answer_data: AnswerSubmit,
+    current_user: dict = Depends(limit_ai_user),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Submit an answer and get evaluation"""
 
+    await owned_interview_session(db, answer_data.session_id, current_user)
     question = await db.question_responses.find_one(
         {
             "session_id": answer_data.session_id,
@@ -1768,14 +1809,18 @@ async def submit_answer(
 
 # Speech endpoints
 @app.post("/api/speech/transcribe", response_model=TranscriptionResponse)
-async def transcribe_audio(audio: UploadFile = File(...)):
+async def transcribe_audio(
+    audio: UploadFile = File(...),
+    current_user: dict = Depends(limit_ai_user),
+):
     """Transcribe uploaded audio to text"""
+    content = await audio.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio must be under 10MB")
 
-    # Save uploaded file temporarily
     file_path = os.path.join(settings.AUDIO_UPLOAD_DIR, f"{uuid.uuid4()}.wav")
 
     with open(file_path, "wb") as f:
-        content = await audio.read()
         f.write(content)
 
     try:
@@ -1785,8 +1830,9 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         return TranscriptionResponse(
             text=transcription
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    except Exception:
+        logger.exception("Transcription failed")
+        raise HTTPException(status_code=500, detail="Transcription failed")
     finally:
         # Clean up
         if os.path.exists(file_path):
@@ -1794,7 +1840,10 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 # TTS endpoints
 @app.get("/api/tts/status", response_model=TtsStatusResponse)
-async def tts_status(db: AsyncIOMotorDatabase = Depends(get_db)):
+async def tts_status(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
     runtime_config = await get_runtime_config(db)
     tts_service.apply_runtime_config(runtime_config)
     provider_ready, availability_reason = await tts_service.check_provider_health()
@@ -1809,7 +1858,7 @@ async def tts_status(db: AsyncIOMotorDatabase = Depends(get_db)):
 
 
 @app.get("/api/tts/voices", response_model=List[TtsVoice])
-async def list_tts_voices():
+async def list_tts_voices(current_user: dict = Depends(get_current_user)):
     provider_ready, availability_reason = await tts_service.check_provider_health()
     if not provider_ready:
         detail = "TTS provider not configured" if availability_reason == "api_key_missing" else f"TTS provider unavailable: {availability_reason}"
@@ -1823,7 +1872,11 @@ async def list_tts_voices():
 
 
 @app.post("/api/tts/synthesize")
-async def synthesize_tts(payload: TtsSynthesizeRequest, db: AsyncIOMotorDatabase = Depends(get_db)):
+async def synthesize_tts(
+    payload: TtsSynthesizeRequest,
+    current_user: dict = Depends(limit_ai_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
     provider_ready, availability_reason = await tts_service.check_provider_health()
     if not provider_ready:
         detail = "TTS provider not configured" if availability_reason == "api_key_missing" else f"TTS provider unavailable: {availability_reason}"
@@ -1858,7 +1911,7 @@ async def synthesize_tts(payload: TtsSynthesizeRequest, db: AsyncIOMotorDatabase
 
 
 @app.get("/api/tts/cache/stats", response_model=TtsCacheStatsResponse)
-async def tts_cache_stats():
+async def tts_cache_stats(current_user: dict = Depends(get_current_user)):
     return TtsCacheStatsResponse(**tts_service.get_cache_stats())
 
 
@@ -2064,14 +2117,12 @@ async def admin_get_journey_content_sync_status(
 @app.post("/api/sessions/{session_id}/complete", response_model=SessionSummary)
 async def complete_session(
     session_id: str,
+    current_user: dict = Depends(limit_ai_user),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Complete session and generate summary"""
 
-    session = await db.interview_sessions.find_one({"session_id": session_id})
-
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session = await owned_interview_session(db, session_id, current_user)
 
     questions = await db.question_responses.find({"session_id": session_id}).sort("question_number", 1).to_list(length=None)
 
@@ -2118,7 +2169,10 @@ async def complete_session(
 
 # AWS Study Mode endpoint
 @app.post("/api/aws/learn", response_model=AwsStudyResponse)
-async def start_aws_learning(request: AwsStudyRequest):
+async def start_aws_learning(
+    request: AwsStudyRequest,
+    current_user: dict = Depends(limit_ai_user),
+):
     """Start an AWS service learning session."""
     try:
         return await generate_aws_learning_response(groq_service, request.service_name)

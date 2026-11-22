@@ -131,3 +131,28 @@ class TestApiErrorHandling:
         """Test missing request body"""
         response = await client.post("/api/auth/register")
         assert response.status_code in [400, 422]
+
+
+class TestLaunchGuards:
+    @pytest.mark.asyncio
+    async def test_signup_is_not_admin(self, client: AsyncClient, sample_user_data):
+        registered = await client.post("/api/auth/register", json=sample_user_data)
+        assert registered.status_code == 200
+        me = await client.get("/api/auth/me")
+        assert me.status_code == 200
+        assert me.json()["is_admin"] is False
+
+    @pytest.mark.asyncio
+    async def test_anonymous_ai_routes_require_auth(self, client: AsyncClient):
+        session = await client.post("/api/sessions", json={"platform": "aws", "difficulty": "junior"})
+        question = await client.post(
+            "/api/questions/generate",
+            json={"session_id": "missing-session", "category": "aws"},
+        )
+        exam = await client.post(
+            "/api/exams/start",
+            json={"certificate": "aws-saa", "question_count": 5},
+        )
+        assert session.status_code == 401
+        assert question.status_code == 401
+        assert exam.status_code == 401
